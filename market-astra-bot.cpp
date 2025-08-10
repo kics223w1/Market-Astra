@@ -7,7 +7,9 @@
 input string ServerHost = "http://127.0.0.1";        // Host
 input int    ServerPort = 3456;                      // Port
 input string BotName    = "Market Astro";            // Bot name
-input ENUM_TIMEFRAMES CandleTimeframe = PERIOD_M1;   // Candle timeframe
+
+// Track current chart timeframe
+ENUM_TIMEFRAMES gChartTimeframe = (ENUM_TIMEFRAMES)0;
 
 datetime lastCandleTime     = 0;
 datetime lastPriceSentTime  = 0;
@@ -20,6 +22,31 @@ int hEMA50 = INVALID_HANDLE;
 int hRSI14 = INVALID_HANDLE;
 int hADX14 = INVALID_HANDLE;
 int hATR14 = INVALID_HANDLE;
+
+// Recreate all indicator handles for the given timeframe
+bool RecreateIndicators(ENUM_TIMEFRAMES tf)
+{
+   // Release old if any
+   if(hEMA20 != INVALID_HANDLE) IndicatorRelease(hEMA20);
+   if(hEMA50 != INVALID_HANDLE) IndicatorRelease(hEMA50);
+   if(hRSI14 != INVALID_HANDLE) IndicatorRelease(hRSI14);
+   if(hADX14 != INVALID_HANDLE) IndicatorRelease(hADX14);
+   if(hATR14 != INVALID_HANDLE) IndicatorRelease(hATR14);
+
+   hEMA20 = iMA(_Symbol, tf, 20, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA50 = iMA(_Symbol, tf, 50, 0, MODE_EMA, PRICE_CLOSE);
+   hRSI14 = iRSI(_Symbol, tf, 14, PRICE_CLOSE);
+   hADX14 = iADX(_Symbol, tf, 14);
+   hATR14 = iATR(_Symbol, tf, 14);
+
+   if(hEMA20==INVALID_HANDLE || hEMA50==INVALID_HANDLE || hRSI14==INVALID_HANDLE ||
+      hADX14==INVALID_HANDLE || hATR14==INVALID_HANDLE)
+   {
+      Print("❌ Failed to create indicator handles. Error: ", GetLastError());
+      return false;
+   }
+   return true;
+}
 
 //+------------------------------------------------------------------+
 //| Helpers                                                          |
@@ -49,30 +76,56 @@ string TimeframeStr(ENUM_TIMEFRAMES tf)
    }
 }
 
+// Build an initialization message sent once on EA start
+string BuildInitMessage()
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double spread_pips = (ask - bid) * PipFactor();
+
+   string msg = StringFormat(
+      "Init Snapshot\n"
+      "Symbol: %s\n"
+      "Timeframe: %s\n"
+      "Time: %s\n"
+      "Bid: %.5f\n"
+      "Ask: %.5f\n"
+      "Spread (pips): %.1f\n"
+      "Server: %s\n"
+      "Account Currency: %s",
+      _Symbol,
+      TimeframeStr(gChartTimeframe),
+      TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES),
+      bid,
+      ask,
+      spread_pips,
+      AccountInfoString(ACCOUNT_SERVER),
+      AccountInfoString(ACCOUNT_CURRENCY)
+   );
+
+   return msg;
+}
+
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit()
 {
    Print("MarketAstra EA initialized ✅");
-   lastCandleTime     = iTime(_Symbol, CandleTimeframe, 0);
-   lastPrice          = iClose(_Symbol, CandleTimeframe, 0);
+
+   gChartTimeframe = (ENUM_TIMEFRAMES)_Period;
+   lastCandleTime     = iTime(_Symbol, gChartTimeframe, 0);
+   lastPrice          = iClose(_Symbol, gChartTimeframe, 0);
    lastPriceSentTime  = TimeCurrent();
    lastTrendSentTime  = TimeCurrent();
 
-   // Create indicator handles
-   hEMA20 = iMA(_Symbol, CandleTimeframe, 20, 0, MODE_EMA, PRICE_CLOSE);
-   hEMA50 = iMA(_Symbol, CandleTimeframe, 50, 0, MODE_EMA, PRICE_CLOSE);
-   hRSI14 = iRSI(_Symbol, CandleTimeframe, 14, PRICE_CLOSE);
-   hADX14 = iADX(_Symbol, CandleTimeframe, 14);
-   hATR14 = iATR(_Symbol, CandleTimeframe, 14);
-
-   if(hEMA20==INVALID_HANDLE || hEMA50==INVALID_HANDLE || hRSI14==INVALID_HANDLE ||
-      hADX14==INVALID_HANDLE || hATR14==INVALID_HANDLE)
-   {
-      Print("❌ Failed to create indicator handles. Error: ", GetLastError());
+   // Create indicator handles (chart timeframe)
+   if(!RecreateIndicators(gChartTimeframe))
       return(INIT_FAILED);
-   }
+
+    // Send an initialization snapshot to the bot endpoint
+    string initData = BuildInitMessage();
+    SendBotData(initData);
 
    return(INIT_SUCCEEDED);
 }
@@ -83,7 +136,23 @@ int OnInit()
 void OnTick()
 {
    datetime now = TimeCurrent();
-   datetime currentCandleTime = iTime(_Symbol, CandleTimeframe, 0);
+
+   // Detect timeframe change on the chart and rebuild indicators if needed
+   ENUM_TIMEFRAMES tfNow = (ENUM_TIMEFRAMES)_Period;
+   if(tfNow != gChartTimeframe)
+   {
+      gChartTimeframe = tfNow;
+      if(!RecreateIndicators(gChartTimeframe))
+      {
+         // If recreation fails, skip this tick
+         return;
+      }
+      // Reset candle reference for new timeframe
+      lastCandleTime = iTime(_Symbol, gChartTimeframe, 0);
+      Print("🔄 Chart timeframe changed. Reinitialized indicators for ", TimeframeStr(gChartTimeframe));
+   }
+
+   datetime currentCandleTime = iTime(_Symbol, gChartTimeframe, 0);
    double   currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    // Send price every 30 seconds (query-only, no body)
@@ -96,14 +165,14 @@ void OnTick()
    // Detect new candle -> send compact candle snapshot in body
    if(currentCandleTime != lastCandleTime)
    {
-      if(Bars(_Symbol, CandleTimeframe) >= 3)
+      if(Bars(_Symbol, gChartTimeframe) >= 3)
       {
-         double open   = iOpen(_Symbol, CandleTimeframe, 1);
-         double close  = iClose(_Symbol, CandleTimeframe, 1);
-         long   volume = (long)iVolume(_Symbol, CandleTimeframe, 1);
+         double open   = iOpen(_Symbol, gChartTimeframe, 1);
+         double close  = iClose(_Symbol, gChartTimeframe, 1);
+         long   volume = (long)iVolume(_Symbol, gChartTimeframe, 1);
          string candleData = StringFormat(
                "New Candle\nSymbol: %s\nTimeframe: %s\nOpen: %.5f\nClose: %.5f\nVolume: %d\nTime: %s",
-               _Symbol, TimeframeStr(CandleTimeframe), open, close, volume,
+               _Symbol, TimeframeStr(gChartTimeframe), open, close, volume,
                TimeToString(currentCandleTime, TIME_DATE | TIME_MINUTES));
          SendBotData(candleData);
       }
@@ -124,7 +193,7 @@ void OnTick()
 //+------------------------------------------------------------------+
 string BuildTrendSnapshot()
 {
-   if(Bars(_Symbol, CandleTimeframe) < 60)
+   if(Bars(_Symbol, gChartTimeframe) < 60)
       return "Trend Snapshot\nError: Not enough bars";
 
    // Prepare buffers
@@ -142,9 +211,9 @@ string BuildTrendSnapshot()
    if(CopyBuffer(hADX14, 0, 0, 1, adx)   < 1)  return "Trend Snapshot\nError: Not enough ADX data";
    if(CopyBuffer(hATR14, 0, 0, 1, atr)   < 1)  return "Trend Snapshot\nError: Not enough ATR data";
 
-   double close0  = iClose(_Symbol, CandleTimeframe, 0);
-   double close5  = iClose(_Symbol, CandleTimeframe, 5);
-   double close20 = iClose(_Symbol, CandleTimeframe, 20);
+   double close0  = iClose(_Symbol, gChartTimeframe, 0);
+   double close5  = iClose(_Symbol, gChartTimeframe, 5);
+   double close20 = iClose(_Symbol, gChartTimeframe, 20);
 
    // Percent changes
    double pct5  = (close5  > 0.0) ? (close0 - close5)  / close5  * 100.0 : 0.0;
@@ -164,12 +233,12 @@ string BuildTrendSnapshot()
 
    // 20-bar high/low breakout context
    int lookback = 20;
-   double hh = iHigh(_Symbol, CandleTimeframe, 1);
-   double ll = iLow(_Symbol, CandleTimeframe, 1);
+   double hh = iHigh(_Symbol, gChartTimeframe, 1);
+   double ll = iLow(_Symbol, gChartTimeframe, 1);
    for(int i=2; i<=lookback; i++)
    {
-      double hi = iHigh(_Symbol, CandleTimeframe, i);
-      double lo = iLow(_Symbol, CandleTimeframe, i);
+      double hi = iHigh(_Symbol, gChartTimeframe, i);
+      double lo = iLow(_Symbol, gChartTimeframe, i);
       if(hi > hh) hh = hi;
       if(lo < ll) ll = lo;
    }
@@ -206,7 +275,7 @@ string BuildTrendSnapshot()
       "Range Context: %s\n"
       "20-bar High: %.5f | 20-bar Low: %.5f",
       _Symbol,
-      TimeframeStr(CandleTimeframe),
+      TimeframeStr(gChartTimeframe),
       TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES),
       dir,
       adx14, strength,
